@@ -2,17 +2,19 @@
 triage.py — Core reasoning module.
 
 Pipeline per ticket:
-  1. Safety gate  → block malicious / prompt-injection requests before hitting the LLM
-  2. BM25 retrieval → fetch top-k corpus documents for the ticket
-  3. LLM call     → Groq (Llama-3.3-70B) with a strict grounding prompt
-  4. Normalise    → validate JSON fields, clamp to allowed enum values
-  5. Log          → append a structured trace to log.txt for every ticket
+  1. Safety gate      → block malicious / prompt-injection requests before hitting the LLM
+  2. Hybrid retrieval → BM25 + TF-IDF cosine, domain-filtered first with full-corpus fallback
+  3. Confidence gate  → auto-escalate when corpus match is too weak (confidence < 0.15)
+  4. LLM call         → Groq (Llama-3.3-70B) with a strict grounding prompt
+  5. Normalise        → validate JSON fields, clamp to allowed enum values
+  6. Log              → append a structured trace to log.txt for every ticket
 
 Design decisions:
   - temperature=0 for determinism (same input → same output every run)
   - Domain-filtered retrieval first; full-corpus fallback when domain is missing
   - Safety gate runs before any LLM call, so malicious tickets never reach the model
-  - All corpus content is injected into the user turn; system prompt only contains rules
+  - Confidence-based auto-escalation prevents hallucinated answers when no docs match
+  - System prompt asks LLM for corpus citations and urgency (1–5) for auditability
 """
 
 import json
@@ -23,12 +25,15 @@ from datetime import datetime
 
 import groq
 
-from retriever import retrieve_for_issue, format_context
+from retriever import retrieve_for_issue, format_context, compute_confidence
 
 # ── LLM client ───────────────────────────────────────────────────────────────
 _client = groq.Groq(api_key=os.environ.get("GROQ_API_KEY"))
 MODEL = "llama-3.3-70b-versatile"
 TEMPERATURE = 0  # deterministic output
+
+# Auto-escalate when corpus confidence is below this threshold
+CONFIDENCE_THRESHOLD = 0.15
 
 # ── Log file path (relative to project root, written by agent.py) ────────────
 LOG_FILE: str | None = None  # set by agent.py before first call
@@ -49,6 +54,7 @@ STRICT RULES — you MUST follow ALL of them
    Ground every response exclusively in the RELEVANT SUPPORT DOCUMENTATION provided below.
    Never invent policies, phone numbers, URLs, or procedures not present in the retrieved context.
    If the context does not cover the issue, say so clearly.
+   For every fact you use, note the DOC_ID it came from (e.g. [hr-010]).
 
 2. ESCALATE when the issue involves any of:
    • Billing disputes, refund requests, or payment processing  → finance team
@@ -82,6 +88,14 @@ STRICT RULES — you MUST follow ALL of them
    If unrelated to HackerRank, Claude, or Visa → status=replied, request_type=invalid,
    politely state out-of-scope.
 
+7. URGENCY SCORING
+   Rate the urgency of this ticket on a scale of 1–5:
+   1 = general question / how-to (no time pressure)
+   2 = minor inconvenience, workaround available
+   3 = moderate impact, affects workflow
+   4 = significant impact, blocking operations
+   5 = critical / account locked / active fraud / platform down
+
 ════════════════════════════════════════
 OUTPUT FORMAT — valid JSON ONLY, no prose before or after
 ════════════════════════════════════════
@@ -89,8 +103,10 @@ OUTPUT FORMAT — valid JSON ONLY, no prose before or after
   "status": "replied" | "escalated",
   "product_area": "<most relevant product area>",
   "response": "<user-facing answer grounded in corpus, 2–5 sentences>",
-  "justification": "<internal reasoning: decision rationale + corpus evidence>",
-  "request_type": "product_issue" | "feature_request" | "bug" | "invalid"
+  "justification": "<internal reasoning: decision rationale + corpus evidence citing DOC_IDs>",
+  "request_type": "product_issue" | "feature_request" | "bug" | "invalid",
+  "urgency": <integer 1–5>,
+  "citations": ["<DOC_ID>", ...]
 }
 """).strip()
 
@@ -137,20 +153,25 @@ def _has_escalation_signal(text: str) -> bool:
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 def _log(ticket_num: int, issue: str, subject: str, company: str,
-         docs: list[dict], prompt: str, raw_response: str, result: dict) -> None:
+         docs: list[dict], prompt: str, raw_response: str, result: dict,
+         confidence: float = 0.0) -> None:
     if not LOG_FILE:
         return
     sep = "═" * 72
     entry = (
         f"\n{sep}\n"
         f"TICKET #{ticket_num}  |  {datetime.now().isoformat()}\n"
-        f"Company : {company or 'None'}\n"
-        f"Subject : {subject or '(no subject)'}\n"
-        f"Issue   : {issue[:300]}{'...' if len(issue) > 300 else ''}\n"
+        f"Company    : {company or 'None'}\n"
+        f"Subject    : {subject or '(no subject)'}\n"
+        f"Issue      : {issue[:300]}{'...' if len(issue) > 300 else ''}\n"
+        f"Confidence : {confidence:.2f}\n"
         f"\n── Retrieved corpus docs ──\n"
     )
     for d in docs:
-        entry += f"  [{d['id']}] [{d['domain']}|{d['product_area']}] {d['title']} (score={d.get('score', 0):.3f})\n"
+        entry += (
+            f"  [{d['id']}] [{d['domain']}|{d['product_area']}] "
+            f"{d['title']} (score={d.get('score', 0):.3f}, bm25={d.get('bm25_score', 0):.3f})\n"
+        )
     entry += (
         f"\n── Prompt sent to LLM ──\n{prompt}\n"
         f"\n── Raw LLM response ──\n{raw_response}\n"
@@ -158,6 +179,9 @@ def _log(ticket_num: int, issue: str, subject: str, company: str,
         f"  status       : {result['status']}\n"
         f"  product_area : {result['product_area']}\n"
         f"  request_type : {result['request_type']}\n"
+        f"  urgency      : {result.get('urgency', 'N/A')}\n"
+        f"  confidence   : {result.get('confidence', 0.0):.2f}\n"
+        f"  citations    : {result.get('citations', [])}\n"
         f"  response     : {result['response'][:200]}...\n"
         f"  justification: {result['justification'][:200]}...\n"
     )
@@ -172,7 +196,8 @@ _ticket_counter = 0
 def triage_ticket(issue: str, subject: str, company: str) -> dict:
     """
     Triage one support ticket end-to-end.
-    Returns: {status, product_area, response, justification, request_type}
+    Returns: {status, product_area, response, justification, request_type,
+              urgency, confidence, citations}
     """
     global _ticket_counter
     _ticket_counter += 1
@@ -193,26 +218,53 @@ def triage_ticket(issue: str, subject: str, company: str) -> dict:
                 "Request rejected per safety policy; no LLM call was made."
             ),
             "request_type": "invalid",
+            "urgency": 1,
+            "confidence": 0.0,
+            "citations": [],
         }
         _log(_ticket_counter, issue, subject, company, [], "(safety gate — no prompt sent)",
-             "(safety gate — no LLM response)", result)
+             "(safety gate — no LLM response)", result, confidence=0.0)
         return result
 
-    # ── 2. Retrieve relevant corpus docs ──────────────────────────────────────
+    # ── 2. Hybrid retrieval ───────────────────────────────────────────────────
     docs = retrieve_for_issue(issue, subject, company, top_k=4)
+    confidence = compute_confidence(docs)
     context = format_context(docs)
 
-    # ── 3. Build prompt ───────────────────────────────────────────────────────
+    # ── 3. Confidence gate — auto-escalate when corpus has no strong match ────
+    if confidence < CONFIDENCE_THRESHOLD:
+        result = {
+            "status": "escalated",
+            "product_area": "general",
+            "response": (
+                "We were unable to find relevant documentation to confidently answer your query. "
+                "Your ticket has been escalated to a human support agent who will review it shortly."
+            ),
+            "justification": (
+                f"Auto-escalated: corpus confidence score {confidence:.2f} is below threshold "
+                f"{CONFIDENCE_THRESHOLD}. No strong corpus match found for this ticket."
+            ),
+            "request_type": "product_issue",
+            "urgency": 3,
+            "confidence": confidence,
+            "citations": [],
+        }
+        _log(_ticket_counter, issue, subject, company, docs, "(confidence gate — no LLM call)",
+             "(confidence gate — no LLM response)", result, confidence=confidence)
+        return result
+
+    # ── 4. Build prompt ───────────────────────────────────────────────────────
     user_msg = (
         f"Support ticket to triage:\n\n"
         f"COMPANY : {company or 'None / Unknown'}\n"
         f"SUBJECT : {subject or '(no subject)'}\n"
         f"ISSUE   :\n{issue}\n\n"
         f"RELEVANT SUPPORT DOCUMENTATION:\n{context}\n\n"
-        f"Analyze this ticket and return your triage decision as JSON only."
+        f"Analyze this ticket and return your triage decision as JSON only. "
+        f"In your citations list, include the DOC_IDs of every document you referenced."
     )
 
-    # ── 4. LLM call ───────────────────────────────────────────────────────────
+    # ── 5. LLM call ───────────────────────────────────────────────────────────
     response = _client.chat.completions.create(
         model=MODEL,
         max_tokens=1024,
@@ -224,7 +276,7 @@ def triage_ticket(issue: str, subject: str, company: str) -> dict:
     )
     raw = response.choices[0].message.content.strip()
 
-    # ── 5. Parse JSON ─────────────────────────────────────────────────────────
+    # ── 6. Parse JSON ─────────────────────────────────────────────────────────
     cleaned = re.sub(r"^```(?:json)?\s*", "", raw)
     cleaned = re.sub(r"\s*```$", "", cleaned)
     try:
@@ -233,10 +285,11 @@ def triage_ticket(issue: str, subject: str, company: str) -> dict:
         m = re.search(r"\{.*\}", cleaned, re.DOTALL)
         result = json.loads(m.group()) if m else _fallback(raw)
 
-    result = _normalise(result)
+    result = _normalise(result, confidence)
 
-    # ── 6. Log ────────────────────────────────────────────────────────────────
-    _log(_ticket_counter, issue, subject, company, docs, user_msg, raw, result)
+    # ── 7. Log ────────────────────────────────────────────────────────────────
+    _log(_ticket_counter, issue, subject, company, docs, user_msg, raw, result,
+         confidence=confidence)
     return result
 
 
@@ -248,10 +301,12 @@ def _fallback(raw: str) -> dict:
         "response": "Unable to process this request automatically. Escalating to a human agent.",
         "justification": f"JSON parse failure — raw model output: {raw[:200]}",
         "request_type": "product_issue",
+        "urgency": 3,
+        "citations": [],
     }
 
 
-def _normalise(r: dict) -> dict:
+def _normalise(r: dict, confidence: float = 0.0) -> dict:
     if r.get("status") not in {"replied", "escalated"}:
         r["status"] = "escalated"
     if r.get("request_type") not in {"product_issue", "feature_request", "bug", "invalid"}:
@@ -259,4 +314,20 @@ def _normalise(r: dict) -> dict:
     r.setdefault("product_area", "general")
     r.setdefault("response", "Escalating to a human agent for further assistance.")
     r.setdefault("justification", "Automated triage decision.")
+
+    # Clamp urgency to integer 1–5
+    try:
+        r["urgency"] = max(1, min(5, int(r.get("urgency", 3))))
+    except (TypeError, ValueError):
+        r["urgency"] = 3
+
+    # Ensure citations is a list of strings
+    citations = r.get("citations", [])
+    if not isinstance(citations, list):
+        citations = []
+    r["citations"] = [str(c) for c in citations]
+
+    # Attach computed confidence (authoritative value from retriever)
+    r["confidence"] = round(confidence, 2)
+
     return r

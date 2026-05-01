@@ -72,8 +72,9 @@ def _read_csv(path: str) -> list[dict]:
 
 
 def _write_csv(path: str, rows: list[dict]) -> None:
-    fields = ["issue", "subject", "company", "response",
-              "product_area", "status", "request_type", "justification"]
+    fields = ["issue", "subject", "company", "response", "product_area",
+              "status", "request_type", "urgency", "confidence", "citations",
+              "justification"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
@@ -90,6 +91,10 @@ def _print_panel(num: int, subject: str, company: str, result: dict) -> None:
     header.append(f"[{company or 'Unknown'}] ", style="bold magenta")
     header.append((subject or "(no subject)")[:60], style="bold")
 
+    urgency    = result.get("urgency", "?")
+    confidence = result.get("confidence", 0.0)
+    citations  = result.get("citations", [])
+
     body = Text()
     body.append("STATUS:       ", style="bold")
     body.append(f"{result['status'].upper()}\n", style=f"bold {color}")
@@ -97,6 +102,13 @@ def _print_panel(num: int, subject: str, company: str, result: dict) -> None:
     body.append(f"{result['product_area']}\n", style="cyan")
     body.append("REQUEST TYPE: ", style="bold")
     body.append(f"{rt}\n", style=_RT_STYLE.get(rt, "white"))
+    body.append("URGENCY:      ", style="bold")
+    body.append(f"{urgency}/5\n", style="bold yellow")
+    body.append("CONFIDENCE:   ", style="bold")
+    body.append(f"{confidence:.2f}\n", style="bold green" if confidence >= 0.5 else "bold red")
+    if citations:
+        body.append("CITATIONS:    ", style="bold")
+        body.append(f"{', '.join(citations)}\n", style="dim")
     body.append("\nRESPONSE:\n", style="bold")
     body.append(f"{result['response']}\n", style="white")
     body.append("\nJUSTIFICATION:\n", style="bold dim")
@@ -187,12 +199,18 @@ def process_file(input_path: str, output_path: str, log_path: str,
                 _print_panel(i, subject, company, result)
                 progress.start()
 
+            citations_str = "; ".join(result.get("citations", []))
             output_rows.append({
-                "issue": issue, "subject": subject, "company": company,
+                "issue":         issue,
+                "subject":       subject,
+                "company":       company,
                 "response":      result["response"],
                 "product_area":  result["product_area"],
                 "status":        result["status"],
                 "request_type":  result["request_type"],
+                "urgency":       result.get("urgency", 3),
+                "confidence":    result.get("confidence", 0.0),
+                "citations":     citations_str,
                 "justification": result["justification"],
             })
             summary_rows.append({**result, "company": company, "subject": subject})

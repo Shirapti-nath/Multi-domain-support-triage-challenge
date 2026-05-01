@@ -25,7 +25,10 @@ log.txt            Full prompt/response trace for every ticket processed
 
 | Decision | Rationale |
 |---|---|
-| **BM25 retrieval** | Lightweight, no external vector DB, fast. Domain-filtered index first; full-corpus fallback when company is None. |
+| **Hybrid BM25 + TF-IDF retrieval** | BM25 handles exact keyword matches (doc IDs, commands, product names). TF-IDF cosine catches paraphrase/synonym matches (e.g. "block crawler" ↔ "stop crawling website"). Combined `0.6 × normalised_BM25 + 0.4 × TF-IDF` improves recall without losing precision. Domain-filtered index first; full-corpus fallback when company is None or best score < 1.5. |
+| **Confidence-based auto-escalation** | Before calling the LLM, `compute_confidence()` scores the top retrieved doc (raw BM25 / 8.0, clamped to 1.0). If confidence < 0.15, the ticket is auto-escalated without an LLM call — preventing hallucinated answers when no corpus match exists. |
+| **Corpus citations in output** | System prompt instructs the LLM to list every `[DOC_ID]` it used. The `citations` field in the JSON output (and CSV) makes answers traceable and auditable. |
+| **Urgency scoring (1–5)** | LLM rates each ticket's urgency on a 1–5 scale (1=general how-to, 5=active fraud/outage). Surfaces time-sensitive tickets for faster human review. |
 | **Groq + Llama-3.3-70B** | Free tier, deterministic at `temperature=0`, highly capable for structured JSON output. |
 | **Safety gate before LLM** | Malicious/injection tickets are caught by regex patterns and never hit the model — saves cost and prevents misuse. |
 | **Structured JSON output** | System prompt demands JSON only; output is validated and clamped to allowed enum values regardless of model variance. |
@@ -81,6 +84,9 @@ python code/agent.py --interactive
 | `response` | free string | User-facing answer, grounded in the support corpus |
 | `justification` | free string | Internal reasoning traceable to corpus evidence |
 | `request_type` | `product_issue` / `feature_request` / `bug` / `invalid` | Best-fit classification |
+| `urgency` | integer 1–5 | Urgency score (1=general how-to, 5=critical/active fraud/outage) |
+| `confidence` | float 0.0–1.0 | Retrieval confidence from corpus (below 0.15 triggers auto-escalation) |
+| `citations` | semicolon-separated doc IDs | Corpus documents cited by the LLM in its answer |
 
 ---
 
@@ -128,6 +134,15 @@ The agent escalates when corpus documentation indicates the issue requires a hum
 Out-of-scope, invalid, or malicious tickets are replied to directly with an appropriate message.
 
 ---
+
+## Improvements over baseline
+
+| Improvement | Implementation |
+|---|---|
+| **Hybrid BM25 + TF-IDF retrieval** | `retriever.py` — `HybridRetriever` combines BM25 (0.6×) and TF-IDF cosine (0.4×); better recall on paraphrased queries |
+| **Corpus citations** | System prompt asks LLM to list `DOC_ID`s used; `citations` column in output CSV for auditability |
+| **Urgency scoring** | LLM assigns urgency 1–5 per ticket; `urgency` column in output CSV |
+| **Confidence-based auto-escalation** | `compute_confidence()` gates every ticket before the LLM; tickets with no strong corpus match are safely escalated |
 
 ## Reproducibility
 
